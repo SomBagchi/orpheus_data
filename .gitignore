@@ -1,0 +1,12 @@
+.env
+*.mp3
+*.wav
+*.m4a
+*.ogg
+*.flac
+*.aac
+*.wma
+scratch.txt
+
+venv/
+.cache
