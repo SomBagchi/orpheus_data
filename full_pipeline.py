@@ -19,6 +19,8 @@ from pydub import AudioSegment
 from pathlib import Path
 import uuid
 import csv
+import concurrent.futures
+import logging
 
 NUM_EPISODES = 10
 RAW_DIR = "raw_clips"
@@ -30,6 +32,11 @@ PROCESSED_DIARISATION_DIR = "processed_diarisation"
 FINAL_CLIPS_DIR = "final_clips"
 CSV_FILE = "index.csv"
 SHOW_NAME = "The Joe Rogan Experience"
+MAX_CONCURRENT_JOBS = 15  # Balance between speed and API limits
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 def authenticate():
     """
@@ -43,7 +50,7 @@ def authenticate():
     sp = Spotify(client_credentials_manager=creds)
     return sp
 
-def get_episode_ids(sp):
+def get_episodes(sp):
     """
     Retrieve episode IDs for a specified podcast show from Spotify.
     
@@ -51,7 +58,7 @@ def get_episode_ids(sp):
         sp: Spotify API object
         
     Returns:
-        List of episode IDs
+        List of tuples containing (episode_id, episode_name, audio_preview_url)
     """
     # 1) Search for the show
     res = sp.search(
@@ -61,10 +68,10 @@ def get_episode_ids(sp):
     )
     show = res["shows"]["items"][0]
     show_id = show["id"]
-    # print(f"Show ID for '{SHOW_NAME}':", show_id)
+    logger.info(f"Show ID for '{SHOW_NAME}': {show_id}")
     
     # 2) Get the num_episodes most recent episodes
-    episode_ids = []
+    episodes = []
     limit = 50  # Spotify API typically allows max 50 per request
     offset = 0
     
@@ -74,8 +81,8 @@ def get_episode_ids(sp):
         if not items:
             break
     
-        # Collect IDs
-        episode_ids.extend(ep["id"] for ep in items if ep is not None)
+        # Collect IDs, names, and preview URLs
+        episodes.extend((ep["id"], ep["name"], ep.get("audio_preview_url")) for ep in items if ep is not None)
     
         # Advance offset; if fewer than `limit` came back, we're done
         offset += len(items)
@@ -83,59 +90,58 @@ def get_episode_ids(sp):
             break
     
         # Stop if we've collected enough episodes
-        if len(episode_ids) >= NUM_EPISODES:
-            episode_ids = episode_ids[:NUM_EPISODES]
+        if len(episodes) >= NUM_EPISODES:
+            episodes = episodes[:NUM_EPISODES]
             break
             
-    return episode_ids
+    return episodes
 
-def download_preview(sp, episode_id):
+def download_previews(episodes):
     """
-    Download previews for a list of episode IDs.
+    Download previews for a batch of episodes.
     
-    Returns:
-        str: The name of the episode
+    Args:
+        sp: Spotify API object
+        episodes: List of (episode_id, episode_name, audio_preview_url) tuples
     """
     # Create output directory if it doesn't exist
     os.makedirs(RAW_DIR, exist_ok=True)
 
-    try:
-        # Get episode metadata
-        ep = sp.episode(episode_id)
-        url = ep.get("audio_preview_url")
-        episode_name = ep.get("name", "Unknown Episode")
-        
-        if not url:
-            print(f"No preview available for episode {episode_id}")
+    for episode in episodes:
+        episode_id, _, preview_url = episode
+        try:
+            # Use the provided preview URL
+            url = preview_url
+                    
+            # Download preview MP3
+            resp = requests.get(url)
+            resp.raise_for_status()
             
-        # Download preview MP3
-        resp = requests.get(url)
-        resp.raise_for_status()
-		
-        os.makedirs(RAW_DIR, exist_ok=True)
-        filename = f"{RAW_DIR}/{episode_id}.mp3"
-        with open(filename, 'wb') as f:
-            f.write(resp.content)
-
-    except Exception as e:
-        print(f"Error processing episode {episode_id}: {e}")
+            filename = f"{RAW_DIR}/{episode_id}.mp3"
+            with open(filename, 'wb') as f:
+                f.write(resp.content)
                 
-    # print(f"Downloaded preview for episode {episode_id} to {filename}")
-    
-    return episode_name
+            logger.info(f"Downloaded preview for episode {episode_id} to {filename}")
 
-def diarise_audio(episode_id):
+        except Exception as e:
+            logger.error(f"Error downloading preview for episode {episode_id}: {e}")
+
+def diarise_audio(episode):
     """
     Diarise an audio file.
+    
+    Args:
+        episode: Tuple of (episode_id, episode_name, audio_preview_url)
     """
+    episode_id = episode[0]
+    
     # Create output directory if it doesn't exist
     os.makedirs(DIARISATION_DIR, exist_ok=True)
 
     load_dotenv()
     api_token = os.getenv("PYANNOTEAI_API_TOKEN")
     if not api_token:
-        print("Error: PYANNOTEAI_API_TOKEN not found in .env")
-        sys.exit(1)
+        raise Exception("PYANNOTEAI_API_TOKEN not found in .env")
 
     headers = {
         "Authorization": f"Bearer {api_token}",
@@ -168,7 +174,7 @@ def diarise_audio(episode_id):
     job = job_resp.json()
     job_id = job["jobId"]
     status = job["status"]
-    # print(f"Job {job_id} submitted, status={status}")
+    logger.info(f"Job {job_id} submitted for episode {episode_id}, status={status}")
 
     # 4. Poll for completion
     while status not in ("succeeded", "failed", "canceled"):
@@ -179,11 +185,10 @@ def diarise_audio(episode_id):
         )
         status_resp.raise_for_status()
         status = status_resp.json()["status"]
-        # print(f"Polling job {job_id}, status={status}")
+        logger.info(f"Polling job {job_id} for episode {episode_id}, status={status}")
 
     if status != "succeeded":
-        print(f"Job ended with status: {status}")
-        sys.exit(1)
+        raise Exception(f"Job ended with status: {status}")
 
     # 5. Fetch and write diarization output
     output = status_resp.json().get("output", {})
@@ -191,12 +196,56 @@ def diarise_audio(episode_id):
     output_path = f"{DIARISATION_DIR}/{episode_id}.json"
     with open(output_path, "w") as fo:
         json.dump(output, fo, indent=2)
-    # print(f"Diarization results saved to {output_path}")
+    logger.info(f"Diarization results saved to {output_path} for episode {episode_id}")
+    return episode_id
 
-def process_diarisation(episode_id):
+def diarise_audios_concurrently(episodes):
+    """
+    Diarise multiple audio files concurrently.
+    
+    Args:
+        episodes: List of episode tuples
+    
+    Returns:
+        List of episode IDs that were successfully processed
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(DIARISATION_DIR, exist_ok=True)
+    
+    successful_episodes = []
+    
+    # Create a thread pool with limited concurrency to avoid API rate limiting
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS) as executor:
+        # Submit all diarisation jobs
+        future_to_episode = {
+            executor.submit(diarise_audio, episode): episode
+            for episode in episodes
+        }
+        
+        # Process results as they complete
+        for future in tqdm(concurrent.futures.as_completed(future_to_episode), 
+                          total=len(future_to_episode), 
+                          desc="Diarising episodes"):
+            episode = future_to_episode[future]
+            episode_id = episode[0]
+            try:
+                result = future.result()
+                successful_episodes.append(episode)
+                logger.info(f"Successfully diarised episode {episode_id}")
+            except Exception as e:
+                logger.error(f"Error diarising episode {episode_id}: {e}")
+    
+    return successful_episodes
+
+def process_diarisation(episode):
     """
     Process a diarisation file.
+    
+    Args:
+        episode: Tuple of (episode_id, episode_name, audio_preview_url)
     """
+    episode_id = episode[0]
+    
     # Create output directory if it doesn't exist
     os.makedirs(PROCESSED_DIARISATION_DIR, exist_ok=True)
 
@@ -208,8 +257,7 @@ def process_diarisation(episode_id):
     # Extract diarization array
     diarization = data.get("diarization", [])
     if not diarization:
-        print("No diarization data found")
-        return
+        raise Exception("No diarization data found")
     
     # Sort blocks by start time
     diarization.sort(key=lambda x: x["start"])
@@ -242,24 +290,15 @@ def process_diarisation(episode_id):
     
     # Find the speaker who spoke the most
     if not speaking_times:
-        print("No speaking time data available")
-        return
+        raise Exception("No speaking time data available")
         
     most_speaking_speaker = max(speaking_times.items(), key=lambda x: x[1])[0]
-    
-    # Print speaker stats
-    # print("Speaker statistics after fusion:")	
-    # for speaker, time in speaking_times.items():
-    #     print(f"{speaker}: {time:.2f} seconds")
-    # print(f"\nKeeping only blocks from {most_speaking_speaker} (spoke the most)")
     
     # Step 3: Keep only blocks from the speaker who spoke the most
     filtered_blocks = [block for block in fused_blocks if block["speaker"] == most_speaking_speaker]
     
     # Step 4: Remove blocks shorter than 3 seconds
-    min_block_duration = 3.0
-    block_count_before_duration_filter = len(filtered_blocks)
-    filtered_blocks = [block for block in filtered_blocks if (block["end"] - block["start"]) >= min_block_duration]
+    filtered_blocks = [block for block in filtered_blocks if (block["end"] - block["start"]) >= MIN_BLOCK_DURATION]
     
     # Prepare output
     output_data = {
@@ -272,21 +311,17 @@ def process_diarisation(episode_id):
     with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2)
     
-    # print(f"\nProcessed diarisation written to {output_file}")
-    # print(f"Original block count: {len(diarization)}")
-    # print(f"After fusion: {len(fused_blocks)}")
-    # print(f"After keeping most speaking speaker: {block_count_before_duration_filter}")
-    # print(f"Final block count (after removing blocks < {min_block_duration}s): {len(filtered_blocks)}")
+    logger.info(f"\nProcessed diarisation written to {output_file}")
 
-def clip_audio(episode_id, episode_name):
+def clip_audio(episode):
     """
     Clip an audio file based on diarisation segments.
     
     Args:
-        diarisation_file: Path to JSON diarisation file
-        audio_file: Path to MP3 audio file
-        output_dir: Directory to save the clips (created if it doesn't exist)
+        episode: Tuple of (episode_id, episode_name, audio_preview_url)
     """
+    episode_id, episode_name, _ = episode
+    
     # Create output directory if it doesn't exist
     os.makedirs(FINAL_CLIPS_DIR, exist_ok=True)
     
@@ -296,15 +331,10 @@ def clip_audio(episode_id, episode_name):
     
     segments = data.get("diarization", [])
     if not segments:
-        print("No diarisation segments found")
-        return
+        raise Exception("No diarisation segments found")
     
     # Load audio file
-    # print(f"Loading audio file: {RAW_DIR}/{episode_id}.mp3")
     audio = AudioSegment.from_file(f"{RAW_DIR}/{episode_id}.mp3")
-    
-    # Process each segment
-    # print(f"Creating {len(segments)} clips...")
     
     # Open CSV file in append mode
     with open(CSV_FILE, 'a', newline='') as csvfile:
@@ -313,7 +343,9 @@ def clip_audio(episode_id, episode_name):
         for i, segment in enumerate(segments, 1):
             start_time = segment["start"] * 1000  # Convert to milliseconds
             end_time = segment["end"] * 1000
-            speaker = segment["speaker"]
+            
+            # Calculate duration in seconds
+            duration_seconds = (end_time - start_time) / 1000
             
             # Generate UUID for this clip
             clip_uuid = str(uuid.uuid4())
@@ -328,21 +360,13 @@ def clip_audio(episode_id, episode_name):
             clip.export(output_file, format="mp3")
             
             # Write to CSV
-            csv_writer.writerow([clip_uuid, i, episode_id, episode_name, SHOW_NAME])
+            csv_writer.writerow([clip_uuid, i, episode_id, episode_name, SHOW_NAME, duration_seconds])
             
-            # print(f"Created: {output_file} ({(end_time-start_time)/1000:.2f} seconds)")
+            logger.info(f"Created: {output_file} ({duration_seconds:.2f} seconds)")
     
-    # print(f"\nDone! Created {len(segments)} clips in {FINAL_CLIPS_DIR}/ directory")
+    logger.info(f"\nDone! Created {len(segments)} clips in {FINAL_CLIPS_DIR}/ directory")
 
-def process_episode(sp, episode_id):
-    episode_name = download_preview(sp, episode_id)
-    diarise_audio(episode_id)
-    process_diarisation(episode_id)
-    clip_audio(episode_id, episode_name)
-
-if __name__ == "__main__":
-    sp = authenticate()
-    episode_ids = get_episode_ids(sp)    
+if __name__ == "__main__":   
     # Ensure the directory exists for the CSV file
     csv_path = Path(CSV_FILE)
     if not csv_path.parent.exists():
@@ -352,10 +376,22 @@ if __name__ == "__main__":
     if not os.path.exists(CSV_FILE):
         with open(CSV_FILE, 'w', newline='') as csvfile:
             csv_writer = csv.writer(csvfile)
-            csv_writer.writerow(['uuid', 'clip_number', 'episode_id', 'episode_name', 'show_name'])
-            # print(f"Created index CSV file at {CSV_FILE}")
-            
-    # Process all episodes
-    for episode_id in tqdm(episode_ids):
-        # print(f"\nProcessing episode: {episode_id}")
-        process_episode(sp, episode_id)
+            csv_writer.writerow(['uuid', 'clip_number', 'episode_id', 'episode_name', 'show_name', 'duration_seconds'])
+            logger.info(f"Created index CSV file at {CSV_FILE}")
+    
+    sp = authenticate()
+    episodes = get_episodes(sp)
+    download_previews(episodes)
+    
+    logger.info(f"Starting concurrent diarisation of {len(episodes)} episodes")
+    successful_episodes = diarise_audios_concurrently(episodes)
+    logger.info(f"Completed diarisation of {len(successful_episodes)}/{len(episodes)} episodes")
+    
+    # # Process all episodes using the concurrent approach
+    # for episode in tqdm(successful_episodes):
+    #     try:
+    #         process_diarisation(episode)
+    #         clip_audio(episode)
+    #         logger.info(f"Successfully processed episode {episode[0]}")
+    #     except Exception as e:
+    #         logger.error(f"Error processing episode {episode[0]}: {e}")
