@@ -192,7 +192,6 @@ def diarise_audio(episode):
 
     # 5. Fetch and write diarization output
     output = status_resp.json().get("output", {})
-    os.makedirs(DIARISATION_DIR, exist_ok=True)
     output_path = f"{DIARISATION_DIR}/{episode_id}.json"
     with open(output_path, "w") as fo:
         json.dump(output, fo, indent=2)
@@ -354,7 +353,8 @@ def clip_audio(episode):
             clip = audio[start_time:end_time]
             
             # Create filename with UUID
-            output_file = f"{FINAL_CLIPS_DIR}/{clip_uuid}.mp3"
+            os.makedirs(f"{FINAL_CLIPS_DIR}/{episode_id}", exist_ok=True)
+            output_file = f"{FINAL_CLIPS_DIR}/{episode_id}/{clip_uuid}.mp3"
             
             # Export clip
             clip.export(output_file, format="mp3")
