@@ -1,0 +1,14 @@
+{
+  "diarization": [
+    {
+      "speaker": "SPEAKER_01",
+      "start": 0.205,
+      "end": 12.665
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 32.045,
+      "end": 61.485
+    }
+  ]
+}

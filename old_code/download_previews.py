@@ -16,7 +16,7 @@ from spotipy.oauth2 import SpotifyOAuth
 from dotenv import load_dotenv
 
 # Create clips directory if it doesn't exist
-CLIPS_DIR = "clips"
+CLIPS_DIR = "raw_clips"
 os.makedirs(CLIPS_DIR, exist_ok=True)
 
 load_dotenv()

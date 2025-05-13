@@ -1,0 +1,54 @@
+{
+  "diarization": [
+    {
+      "speaker": "SPEAKER_01",
+      "start": 0.205,
+      "end": 5.465
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 5.825,
+      "end": 12.665
+    },
+    {
+      "speaker": "SPEAKER_00",
+      "start": 14.625,
+      "end": 15.165
+    },
+    {
+      "speaker": "SPEAKER_00",
+      "start": 15.625,
+      "end": 16.885
+    },
+    {
+      "speaker": "SPEAKER_00",
+      "start": 16.985,
+      "end": 31.925
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 32.045,
+      "end": 37.485
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 38.225,
+      "end": 43.765
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 44.245,
+      "end": 49.285
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 49.925,
+      "end": 50.885
+    },
+    {
+      "speaker": "SPEAKER_01",
+      "start": 51.665,
+      "end": 61.485
+    }
+  ]
+}

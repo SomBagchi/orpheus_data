@@ -10,3 +10,8 @@ scratch.txt
 
 venv/
 .cache
+
+diarisation/
+processed_diarisation/
+raw_clips/
+final_clips/
