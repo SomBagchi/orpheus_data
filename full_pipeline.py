@@ -22,6 +22,10 @@ import csv
 import concurrent.futures
 import logging
 import traceback
+import whisperx
+import torch
+import re
+
 NUM_EPISODES = 10
 RAW_DIR = "raw_clips"
 API_BASE = "https://api.pyannote.ai/v1"
@@ -384,7 +388,172 @@ def create_penultimate_clips(episode, processed_diarisation):
             json.dump(clip_meta, f, indent=2)
         
     logger.info(f"Created {len(fused_segments)} clips for episode {episode_id} in {episode_clips_dir}")
+
+def transcribe_and_process_clips(episode):
+    """
+    Transcribe clips using WhisperX and process them according to punctuation rules.
     
+    Args:
+        episode: Tuple of (episode_id, episode_name, audio_preview_url)
+    """
+    os.makedirs(FINAL_CLIPS_DIR, exist_ok=True)
+    
+    episode_id, episode_name, _ = episode
+    
+    # Ensure episode directory exists in final clips
+    episode_final_dir = f"{FINAL_CLIPS_DIR}/{episode_id}"
+    os.makedirs(episode_final_dir, exist_ok=True)
+    
+    # Load WhisperX model
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    
+    model = whisperx.load_model("base", device, compute_type=compute_type)
+    
+    # Get the penultimate clips directory for this episode
+    episode_clips_dir = f"{PENULTIMATE_CLIPS_DIR}/{episode_id}"
+    
+    # Get all the MP3 files in the directory
+    mp3_files = [f for f in os.listdir(episode_clips_dir) if f.endswith('.mp3')]
+    
+    # Process each clip
+    for mp3_file in mp3_files:
+        clip_path = f"{episode_clips_dir}/{mp3_file}"
+        
+        # Get metadata file path
+        meta_file = mp3_file.replace('.mp3', '.json')
+        meta_path = f"{episode_clips_dir}/{meta_file}"
+        
+        with open(meta_path, 'r') as f:
+            metadata = json.load(f)
+        
+        clip_number = metadata['clip_number']
+        original_start_time = metadata['start_time']
+        original_end_time = metadata['end_time']
+        original_duration = metadata['duration']
+        
+        # Skip if clip is too short
+        if original_duration < MIN_CLIP_DURATION:
+            logger.info(f"Skipping clip {mp3_file} as it's too short ({original_duration} seconds)")
+            continue
+        
+        # Transcribe audio with WhisperX
+        try:
+            logger.info(f"Transcribing {mp3_file}")
+            result = model.transcribe(clip_path)
+            
+            # Get the transcript
+            segments = result["segments"]
+            
+            if not segments:
+                logger.warning(f"No transcript generated for {mp3_file}")
+                continue
+                
+            # Combine all segments into a full transcript
+            full_transcript = " ".join([s["text"].strip() for s in segments])
+            
+            # New start and end times based on punctuation rules
+            new_start_time = original_start_time
+            new_end_time = original_end_time
+            
+            # Check if transcript starts with a capital letter
+            if not full_transcript or not full_transcript[0].isupper():
+                # Find the first punctuation mark
+                punctuation_pattern = r'[,.!?;]'
+                first_punct_match = re.search(punctuation_pattern, full_transcript)
+                
+                if first_punct_match and segments:
+                    # Find which segment contains the punctuation
+                    punct_pos = first_punct_match.start()
+                    char_count = 0
+                    
+                    for segment in segments:
+                        segment_text = segment["text"].strip()
+                        if char_count + len(segment_text) > punct_pos:
+                            # Found the segment with the punctuation
+                            relative_pos = punct_pos - char_count
+                            
+                            # Estimate timestamp based on relative position in the segment
+                            if len(segment_text) > 0:
+                                segment_duration = segment["end"] - segment["start"]
+                                relative_time = segment["start"] + (relative_pos / len(segment_text)) * segment_duration
+                                new_start_time = original_start_time + relative_time
+                            break
+                        
+                        char_count += len(segment_text) + 1  # +1 for the space we add when joining
+            
+            # Check if transcript ends with punctuation
+            if full_transcript and not re.search(r'[,.!?;]$', full_transcript):
+                # Find the last punctuation mark
+                last_punct_match = None
+                for match in re.finditer(r'[,.!?;]', full_transcript):
+                    last_punct_match = match
+                
+                if last_punct_match and segments:
+                    # Find which segment contains the last punctuation
+                    punct_pos = last_punct_match.start()
+                    char_count = 0
+                    
+                    for segment in segments:
+                        segment_text = segment["text"].strip()
+                        if char_count + len(segment_text) > punct_pos:
+                            # Found the segment with the punctuation
+                            relative_pos = punct_pos - char_count
+                            
+                            # Estimate timestamp based on relative position in the segment
+                            if len(segment_text) > 0:
+                                segment_duration = segment["end"] - segment["start"]
+                                relative_time = segment["start"] + (relative_pos / len(segment_text)) * segment_duration
+                                new_end_time = original_start_time + relative_time
+                            break
+                        
+                        char_count += len(segment_text) + 1  # +1 for the space we add when joining
+            
+            # Check if the new clip duration is sufficient
+            new_duration = new_end_time - new_start_time
+            if new_duration < MIN_CLIP_DURATION:
+                logger.info(f"Skipping clip {mp3_file} as the processed duration ({new_duration} seconds) is too short")
+                continue
+            
+            # Load the audio and create the new clip
+            audio = AudioSegment.from_mp3(clip_path)
+            
+            # Convert times to milliseconds for pydub
+            new_start_ms = int((new_start_time - original_start_time) * 1000)
+            new_end_ms = int((new_end_time - original_start_time) * 1000)
+            
+            # Ensure we don't go out of bounds
+            new_start_ms = max(0, new_start_ms)
+            new_end_ms = min(len(audio), new_end_ms)
+            
+            # Create the new clip
+            new_clip = audio[new_start_ms:new_end_ms]
+            
+            # Generate UUID for the clip
+            clip_uuid = str(uuid.uuid4())
+            
+            # Save the new clip
+            new_clip_path = f"{episode_final_dir}/{clip_uuid}.mp3"
+            new_clip.export(new_clip_path, format="mp3")
+            
+            # Add entry to CSV
+            with open(CSV_FILE, 'a', newline='') as csvfile:
+                csv_writer = csv.writer(csvfile)
+                csv_writer.writerow([
+                    clip_uuid, 
+                    clip_number, 
+                    episode_id, 
+                    episode_name, 
+                    SHOW_NAME, 
+                    new_duration,
+                    full_transcript
+                ])
+            
+            logger.info(f"Created final clip for {mp3_file} at {new_clip_path}")
+            
+        except Exception as e:
+            logger.error(f"Error processing clip {mp3_file}: {e}")
+            traceback.print_exc()
 
 def process_audio(episode):
     """
@@ -440,17 +609,50 @@ def process_audios_concurrently(episodes):
     
     return successful_episodes
 
+def transcribe_and_process_clips_concurrently(episodes):
+    """
+    Transcribe and process clips concurrently.
+    
+    Args:
+        episodes: List of episode tuples
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(FINAL_CLIPS_DIR, exist_ok=True)
+    
+    # Create a thread pool with limited concurrency 
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_CONCURRENT_JOBS) as executor:
+        # Submit all transcription jobs
+        future_to_episode = {
+            executor.submit(transcribe_and_process_clips, episode): episode
+            for episode in episodes
+        }
+        
+        # Process results as they complete
+        for future in tqdm(concurrent.futures.as_completed(future_to_episode), 
+                          total=len(future_to_episode), 
+                          desc="Transcribing and processing episodes"):
+            episode = future_to_episode[future]
+            episode_id = episode[0]
+            try:
+                future.result()
+                logger.info(f"Successfully transcribed and processed episode {episode_id}")
+            except Exception as e:
+                logger.error(f"Error transcribing and processing: {episode_id}: {e}")
+
 if __name__ == "__main__":   
     # Ensure the directory exists for the CSV file
     csv_path = Path(CSV_FILE)
     if not csv_path.parent.exists():
         csv_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # Create CSV with headers if it doesn't exist
+    # Create CSV with headers if it doesn't exist, or check and update if it exists
+    csv_headers = ['uuid', 'clip_number', 'episode_id', 'episode_name', 'show_name', 'duration_seconds', 'transcript']
+    
     if not os.path.exists(CSV_FILE):
+        # Create new CSV with headers
         with open(CSV_FILE, 'w', newline='') as csvfile:
             csv_writer = csv.writer(csvfile)
-            csv_writer.writerow(['uuid', 'clip_number', 'episode_id', 'episode_name', 'show_name', 'duration_seconds'])
+            csv_writer.writerow(csv_headers)
             logger.info(f"Created index CSV file at {CSV_FILE}")
     
     sp = authenticate()
@@ -460,3 +662,8 @@ if __name__ == "__main__":
     logger.info(f"Starting concurrent processing of {len(episodes)} episodes")
     successful_episodes = process_audios_concurrently(episodes)
     logger.info(f"Completed processing {len(successful_episodes)}/{len(episodes)} episodes")
+    
+    # Transcribe and process the clips
+    logger.info(f"Starting transcription and processing of clips for {len(successful_episodes)} episodes")
+    transcribe_and_process_clips_concurrently(successful_episodes)
+    logger.info("Completed transcription and processing of clips")
