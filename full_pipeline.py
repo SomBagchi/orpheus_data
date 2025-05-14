@@ -25,6 +25,7 @@ import traceback
 import whisperx
 import torch
 import re
+import time
 
 NUM_EPISODES = 10
 RAW_DIR = "raw_clips"
@@ -112,7 +113,7 @@ def download_previews(episodes):
     # Create output directory if it doesn't exist
     os.makedirs(RAW_DIR, exist_ok=True)
 
-    for episode in episodes:
+    for episode in tqdm(episodes):
         episode_id, _, preview_url = episode
         try:
             # Use the provided preview URL
@@ -840,6 +841,7 @@ def transcribe_and_process_clips_concurrently(episodes):
                 logger.error(f"Error transcribing and processing: {episode_id}: {e}")
 
 if __name__ == "__main__":   
+    start_time = time.time()
     # Ensure the directory exists for the CSV file
     csv_path = Path(CSV_FILE)
     if not csv_path.parent.exists():
@@ -867,3 +869,5 @@ if __name__ == "__main__":
     logger.info(f"Starting transcription and processing of clips for {len(successful_episodes)} episodes")
     transcribe_and_process_clips_concurrently(successful_episodes)
     logger.info("Completed transcription and processing of clips")
+    end_time = time.time()
+    logger.info(f"Total time taken: {end_time - start_time} seconds")
