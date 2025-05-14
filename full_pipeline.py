@@ -39,7 +39,7 @@ MAX_PAUSE_LENGTH = 1.0
 MIN_CLIP_DURATION = 3.0
 PROCESSED_DIARISATION_DIR = "processed_diarisation"
 FINAL_CLIPS_DIR = "final_clips"
-CSV_FILE = "index.csv"
+CSV_FILE = "data.csv"
 SHOW_NAME = "The Joe Rogan Experience"
 PENULTIMATE_CLIPS_DIR = "penultimate_clips"
 MAX_CONCURRENT_JOBS = 15  # Balance between speed and API limits
@@ -471,9 +471,11 @@ def transcribe_and_process_clips(episode):
                 # Combine all segments into a full transcript
                 full_transcript = " ".join([s["text"].strip() for s in segments])
                 
-                # Check if clip is longer than 30 seconds and split if needed
-                if original_duration > 30.0:
-                    logger.info(f"Clip {mp3_file} is longer than 30 seconds ({original_duration}s), checking for split")
+                # Check if clip is longer than 30 seconds or if it's the only clip for the episode
+                should_split = original_duration > 30.0 or len(mp3_files) == 1
+                
+                if should_split:
+                    logger.info(f"Clip {mp3_file} will be split (duration: {original_duration}s, only clip: {len(mp3_files) == 1})")
                     
                     # Find midpoint time of the clip
                     midpoint_time = original_start_time + (original_duration / 2)
