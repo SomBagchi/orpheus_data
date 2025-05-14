@@ -25,6 +25,7 @@ import traceback
 import whisperx
 import torch
 import re
+import time
 
 NUM_EPISODES = 10
 RAW_DIR = "raw_clips"
@@ -112,7 +113,7 @@ def download_previews(episodes):
     # Create output directory if it doesn't exist
     os.makedirs(RAW_DIR, exist_ok=True)
 
-    for episode in episodes:
+    for episode in tqdm(episodes):
         episode_id, _, preview_url = episode
         try:
             # Use the provided preview URL
@@ -416,6 +417,9 @@ def transcribe_and_process_clips(episode):
     # Get all the MP3 files in the directory
     mp3_files = [f for f in os.listdir(episode_clips_dir) if f.endswith('.mp3')]
     
+    # Store final clips for sequential numbering
+    final_clips = []
+    
     # Process each clip
     for mp3_file in mp3_files:
         clip_path = f"{episode_clips_dir}/{mp3_file}"
@@ -440,7 +444,7 @@ def transcribe_and_process_clips(episode):
         # Transcribe audio with WhisperX
         try:
             logger.info(f"Transcribing {mp3_file}")
-            result = model.transcribe(clip_path)
+            result = model.transcribe(clip_path, language="en")
             
             # Get the transcript
             segments = result["segments"]
@@ -451,6 +455,184 @@ def transcribe_and_process_clips(episode):
                 
             # Combine all segments into a full transcript
             full_transcript = " ".join([s["text"].strip() for s in segments])
+            
+            # Check if clip is longer than 30 seconds and split if needed
+            if original_duration > 30.0:
+                logger.info(f"Clip {mp3_file} is longer than 30 seconds ({original_duration}s), checking for split")
+                
+                # Find midpoint time of the clip
+                midpoint_time = original_start_time + (original_duration / 2)
+                midpoint_relative = original_duration / 2
+                
+                # Find the segment that contains the midpoint
+                midpoint_segment = None
+                accumulated_duration = 0
+                
+                for segment in segments:
+                    segment_start = segment["start"]
+                    segment_end = segment["end"]
+                    
+                    if segment_start <= midpoint_relative <= segment_end:
+                        midpoint_segment = segment
+                        break
+                    
+                    accumulated_duration += segment_end - segment_start
+                
+                if midpoint_segment:
+                    # Find the position in the transcript that corresponds to the midpoint
+                    full_text_pos = 0
+                    for i, segment in enumerate(segments):
+                        segment_text = segment["text"].strip()
+                        
+                        if segment == midpoint_segment:
+                            # Find relative position within the segment
+                            segment_duration = segment["end"] - segment["start"]
+                            relative_pos_in_segment = (midpoint_relative - segment["start"]) / segment_duration
+                            estimated_char_pos = int(len(segment_text) * relative_pos_in_segment)
+                            full_text_pos += estimated_char_pos
+                            break
+                        
+                        full_text_pos += len(segment_text) + 1  # +1 for the space
+                    
+                    # Find the first punctuation mark after the midpoint
+                    punctuation_pattern = r'[,.!?;]'
+                    matches = list(re.finditer(punctuation_pattern, full_transcript[full_text_pos:]))
+                    
+                    if matches:
+                        # Found a punctuation mark after midpoint
+                        first_punct_match = matches[0]
+                        punct_pos = full_text_pos + first_punct_match.start()
+                        
+                        # Find which segment contains this punctuation
+                        char_count = 0
+                        split_segment = None
+                        split_time_relative = 0
+                        
+                        for segment in segments:
+                            segment_text = segment["text"].strip()
+                            
+                            if char_count <= punct_pos < char_count + len(segment_text):
+                                # Found the segment with the punctuation
+                                relative_pos = punct_pos - char_count
+                                
+                                # Calculate the timestamp based on relative position in the segment
+                                if len(segment_text) > 0:
+                                    segment_duration = segment["end"] - segment["start"]
+                                    relative_time = segment["start"] + (relative_pos / len(segment_text)) * segment_duration
+                                    split_time_relative = relative_time
+                                    split_segment = segment
+                                break
+                            
+                            char_count += len(segment_text) + 1  # +1 for the space
+                        
+                        if split_segment:
+                            # Calculate the absolute split time
+                            split_time = original_start_time + split_time_relative
+                            
+                            # Create two clips: original_start to split_time and split_time to original_end
+                            audio = AudioSegment.from_mp3(clip_path)
+                            
+                            # First clip
+                            first_clip_start_ms = 0
+                            first_clip_end_ms = int((split_time - original_start_time) * 1000)
+                            first_duration = (split_time - original_start_time)
+                            
+                            # Second clip
+                            second_clip_start_ms = first_clip_end_ms
+                            second_clip_end_ms = int(original_duration * 1000)
+                            second_duration = (original_end_time - split_time)
+                            
+                            # Process clips separately if they're long enough
+                            if first_duration >= MIN_CLIP_DURATION:
+                                first_clip = audio[first_clip_start_ms:first_clip_end_ms]
+                                
+                                # Get transcript for first clip
+                                first_transcript = ""
+                                char_count = 0
+                                for segment in segments:
+                                    segment_text = segment["text"].strip()
+                                    
+                                    if char_count + len(segment_text) <= punct_pos:
+                                        first_transcript += segment_text + " "
+                                    elif char_count < punct_pos:
+                                        # Split this segment
+                                        split_pos = punct_pos - char_count
+                                        first_transcript += segment_text[:split_pos+1]  # Include the punctuation
+                                        break
+                                    
+                                    char_count += len(segment_text) + 1
+                                
+                                first_transcript = first_transcript.strip()
+                                
+                                # Generate UUID for the clip
+                                clip_uuid = str(uuid.uuid4())
+                                
+                                # Save the new clip
+                                new_clip_path = f"{episode_final_dir}/{clip_uuid}.mp3"
+                                first_clip.export(new_clip_path, format="mp3")
+                                
+                                # Store clip information
+                                final_clips.append({
+                                    "uuid": clip_uuid,
+                                    "source_number": clip_number,
+                                    "part": "first",
+                                    "episode_id": episode_id,
+                                    "episode_name": episode_name,
+                                    "duration": first_duration,
+                                    "transcript": first_transcript,
+                                    "path": new_clip_path
+                                })
+                                
+                                logger.info(f"Created first part clip for {mp3_file}")
+                            
+                            if second_duration >= MIN_CLIP_DURATION:
+                                second_clip = audio[second_clip_start_ms:second_clip_end_ms]
+                                
+                                # Get transcript for second clip
+                                second_transcript = ""
+                                char_count = 0
+                                started_second = False
+                                
+                                for segment in segments:
+                                    segment_text = segment["text"].strip()
+                                    
+                                    if char_count + len(segment_text) > punct_pos:
+                                        if not started_second:
+                                            # Start from after the punctuation
+                                            split_pos = punct_pos - char_count
+                                            if split_pos + 1 < len(segment_text):
+                                                second_transcript += segment_text[split_pos+1:] + " "
+                                            started_second = True
+                                        else:
+                                            second_transcript += segment_text + " "
+                                    
+                                    char_count += len(segment_text) + 1
+                                
+                                second_transcript = second_transcript.strip()
+                                
+                                # Generate UUID for the clip
+                                clip_uuid = str(uuid.uuid4())
+                                
+                                # Save the new clip
+                                new_clip_path = f"{episode_final_dir}/{clip_uuid}.mp3"
+                                second_clip.export(new_clip_path, format="mp3")
+                                
+                                # Store clip information
+                                final_clips.append({
+                                    "uuid": clip_uuid,
+                                    "source_number": clip_number,
+                                    "part": "second",
+                                    "episode_id": episode_id,
+                                    "episode_name": episode_name,
+                                    "duration": second_duration,
+                                    "transcript": second_transcript,
+                                    "path": new_clip_path
+                                })
+                                
+                                logger.info(f"Created second part clip for {mp3_file}")
+                            
+                            # Skip the rest of the processing since we've handled this clip
+                            continue
             
             # New start and end times based on punctuation rules
             new_start_time = original_start_time
@@ -536,24 +718,43 @@ def transcribe_and_process_clips(episode):
             new_clip_path = f"{episode_final_dir}/{clip_uuid}.mp3"
             new_clip.export(new_clip_path, format="mp3")
             
-            # Add entry to CSV
-            with open(CSV_FILE, 'a', newline='') as csvfile:
-                csv_writer = csv.writer(csvfile)
-                csv_writer.writerow([
-                    clip_uuid, 
-                    clip_number, 
-                    episode_id, 
-                    episode_name, 
-                    SHOW_NAME, 
-                    new_duration,
-                    full_transcript
-                ])
+            # Store clip information
+            final_clips.append({
+                "uuid": clip_uuid,
+                "source_number": clip_number,
+                "part": "single",
+                "episode_id": episode_id,
+                "episode_name": episode_name,
+                "duration": new_duration,
+                "transcript": full_transcript,
+                "path": new_clip_path
+            })
             
-            logger.info(f"Created final clip for {mp3_file} at {new_clip_path}")
+            logger.info(f"Created clip for {mp3_file}")
             
         except Exception as e:
             logger.error(f"Error processing clip {mp3_file}: {e}")
             traceback.print_exc()
+    
+    # Sort final clips by source number and part (to maintain order)
+    final_clips.sort(key=lambda x: (x["source_number"], 0 if x["part"] == "first" else (1 if x["part"] == "second" else 2)))
+    
+    # Now write to CSV with sequential numbering
+    with open(CSV_FILE, 'a', newline='') as csvfile:
+        csv_writer = csv.writer(csvfile)
+        
+        for i, clip in enumerate(final_clips, 1):
+            csv_writer.writerow([
+                clip["uuid"],
+                i,  # Sequential numbering starting from 1
+                clip["episode_id"],
+                clip["episode_name"],
+                SHOW_NAME,
+                clip["duration"],
+                clip["transcript"]
+            ])
+    
+    logger.info(f"Created {len(final_clips)} final clips for episode {episode_id} with sequential numbering")
 
 def process_audio(episode):
     """
@@ -640,6 +841,7 @@ def transcribe_and_process_clips_concurrently(episodes):
                 logger.error(f"Error transcribing and processing: {episode_id}: {e}")
 
 if __name__ == "__main__":   
+    start_time = time.time()
     # Ensure the directory exists for the CSV file
     csv_path = Path(CSV_FILE)
     if not csv_path.parent.exists():
@@ -667,3 +869,5 @@ if __name__ == "__main__":
     logger.info(f"Starting transcription and processing of clips for {len(successful_episodes)} episodes")
     transcribe_and_process_clips_concurrently(successful_episodes)
     logger.info("Completed transcription and processing of clips")
+    end_time = time.time()
+    logger.info(f"Total time taken: {end_time - start_time} seconds")
