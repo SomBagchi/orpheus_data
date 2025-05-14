@@ -16,5 +16,5 @@ processed_diarisation/
 raw_clips/
 final_clips/
 penultimate_clips/
-index.csv
+data.csv
 orpheus_voice_cloning/
