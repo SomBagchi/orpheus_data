@@ -17,3 +17,5 @@ raw_clips/
 final_clips/
 penultimate_clips/
 index.csv
+orpheus_voice_cloning/
+pipeline.log

@@ -31,7 +31,7 @@ import time
 # Set this to "0" to disable CUDA, or "1" to enable (if available)
 os.environ["CUDA_VISIBLE_DEVICES"] = "" # Disable CUDA by default
 
-NUM_EPISODES = 10
+NUM_EPISODES = 1000
 RAW_DIR = "raw_clips"
 API_BASE = "https://api.pyannote.ai/v1"
 DIARISATION_DIR = "diarisation"
