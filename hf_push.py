@@ -12,24 +12,35 @@ api = HfApi()
 
 # 2) Clone it locally or pull if it already exists
 repo_path = "orpheus_voice_cloning"
-if os.path.exists(repo_path):
-    repo = Repository(local_dir=repo_path)
-    print(f"Repository already exists. Pulling latest changes...")
-    repo.git_pull()
-else:
+try:
+    if os.path.exists(repo_path):
+        repo = Repository(local_dir=repo_path, clone_from="SomBagchi/orpheus_voice_cloning", repo_type="dataset")
+        print(f"Repository exists. Pulling latest changes...")
+        repo.git_pull()
+    else:
+        repo = Repository(
+            local_dir=repo_path,
+            clone_from="SomBagchi/orpheus_voice_cloning",
+            repo_type="dataset"
+        )
+except Exception as e:
+    print(f"Error with existing directory: {e}")
+    print("Removing problematic directory and re-cloning...")
+    if os.path.exists(repo_path):
+        shutil.rmtree(repo_path)
     repo = Repository(
         local_dir=repo_path,
         clone_from="SomBagchi/orpheus_voice_cloning",
         repo_type="dataset"
     )
 
-# 3) Copy your CSV and audio folder in
-print("Copying files...")
-shutil.copy("index.csv", f"{repo_path}/data.csv")
-if os.path.exists(f"{repo_path}/final_clips"):
-    print("Removing existing final_clips directory...")
-    shutil.rmtree(f"{repo_path}/final_clips")
-shutil.copytree("final_clips", f"{repo_path}/final_clips")
+# # 3) Copy your CSV and audio folder in
+# print("Copying files...")
+# shutil.copy("index.csv", f"{repo_path}/data.csv")
+# if os.path.exists(f"{repo_path}/final_clips"):
+#     print("Removing existing final_clips directory...")
+#     shutil.rmtree(f"{repo_path}/final_clips")
+# shutil.copytree("final_clips", f"{repo_path}/final_clips")
 
 # 4) Track MP3s with LFS, commit and push
 print("Adding, committing, and pushing changes...")
